@@ -1,0 +1,22 @@
+# Credenciales y entorno
+.env
+
+# Bases de datos
+*.sqlite
+db.sqlite
+
+# Python y Entornos
+.venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+
+# Cachés y temporales
+.cache/
+scripts/temp.txt
+
+# Archivos de planes y desarrollo local
+plan.md
+*_plan.md
+multimodel.md
+personas/people-legacy.yaml
