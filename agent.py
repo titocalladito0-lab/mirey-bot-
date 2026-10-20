@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
 from google import genai
-from google.genai import types
+from google.genai import errors, types
 
 from config import Settings, settings
 from memory import MemoryStore
@@ -80,24 +81,54 @@ class MireyAgent:
         if request.repetition_instruction:
             prompt += f"\n\nSystem instruction note: {request.repetition_instruction}"
 
-        def _call_gemini():
-            model_name = getattr(self.config, "gemini_model", None) or "gemini-3.8-flash"
-            return self.client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_instruction,
-                    temperature=0.7,
-                    # Desactiva búsquedas / llamadas a funciones automáticas que ralentizan
-                    tools=[],
-                ),
+        def _call_gemini_with_fallback():
+            primary_model = getattr(self.config, "gemini_model", None) or "gemini-3.8-flash"
+            fallback_model = "gemini-1.5-flash"
+            models_to_try = [primary_model, fallback_model]
+            
+            config_params = types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                temperature=0.7,
+                tools=[],
             )
 
+            last_exception = None
+
+            for model in models_to_try:
+                # Intentamos hasta 2 veces por modelo en caso de saturación temporal (503)
+                for attempt in range(2):
+                    try:
+                        response = self.client.models.generate_content(
+                            model=model,
+                            contents=prompt,
+                            config=config_params,
+                        )
+                        if response and response.text:
+                            return response.text.strip()
+                    except errors.ServerError as e:
+                        last_exception = e
+                        # Si es error 503 (saturación), esperamos 2 segundos y reintentamos en el mismo modelo
+                        if getattr(e, "code", None) == 503 and attempt == 0:
+                            time.sleep(2)
+                            continue
+                        break # Si falla de nuevo, pasamos al modelo de respaldo
+                    except errors.ClientError as e:
+                        last_exception = e
+                        break # Si el modelo da error de cliente (ej. 404), probamos directamente el siguiente modelo
+                    except Exception as e:
+                        last_exception = e
+                        break
+            
+            if last_exception:
+                raise last_exception
+            raise Exception("No se pudo obtener respuesta de ningún modelo.")
+
         try:
-            # Aumentado a 60 segundos para evitar falsos timeouts
-            response = await asyncio.wait_for(asyncio.to_thread(_call_gemini), timeout=120.0)
-            text = response.text.strip() if response.text else ""
-            return AgentResponse(text=text)
+            # Aumentado a 120 segundos para dar margen a reintentos y fallbacks
+            response_text = await asyncio.wait_for(
+                asyncio.to_thread(_call_gemini_with_fallback), timeout=120.0
+            )
+            return AgentResponse(text=response_text)
         except asyncio.TimeoutError:
             log.warning("Timeout de Gemini API al generar respuesta.")
             return AgentResponse(text="¡Espera un momento...! Me tardé en conectar con la nube.")
