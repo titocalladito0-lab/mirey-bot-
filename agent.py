@@ -56,9 +56,15 @@ class MireyAgent:
         bot_was_mentioned: bool,
         is_dm: bool,
     ) -> bool:
+        # Solo responde si:
+        # 1. Es un mensaje privado (DM)
+        # 2. Mencionan al bot directamente (@mirey)
+        # 3. Escriben la palabra "mirey" en el texto
         if is_dm or bot_was_mentioned or "mirey" in content.lower():
             return True
-        return await self._classify_relevance(context_key, content)
+            
+        # Si no cumple ninguna de las anteriores, IGNORA el mensaje y no participa
+        return False
 
     async def generate(self, request: AgentRequest) -> AgentResponse:
         snapshot = (
