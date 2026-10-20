@@ -74,9 +74,8 @@ class MireyAgent:
         if request.repetition_instruction:
             prompt += f"\n\nSystem instruction note: {request.repetition_instruction}"
 
-        # Función interna bloqueante para correr en un hilo separado
         def _call_gemini():
-            model_name = getattr(self.config, "gemini_model", None) or "gemini-1.5-flash"
+            model_name = getattr(self.config, "gemini_model", None) or "gemini-3.8-flash"
             return self.client.models.generate_content(
                 model=model_name,
                 contents=prompt,
@@ -87,7 +86,8 @@ class MireyAgent:
             )
 
         try:
-            response = await asyncio.wait_for(asyncio.to_thread(_call_gemini), timeout=20.0)
+            # Aumentado a 60 segundos para evitar falsos timeouts
+            response = await asyncio.wait_for(asyncio.to_thread(_call_gemini), timeout=60.0)
             text = response.text.strip() if response.text else ""
             return AgentResponse(text=text)
         except asyncio.TimeoutError:
@@ -110,7 +110,7 @@ Newest message:
 {content}"""
 
         def _call_classifier():
-            model_name = getattr(self.config, "gemini_model", None) or "gemini-1.5-flash"
+            model_name = getattr(self.config, "gemini_model", None) or "gemini-3.8-flash"
             return self.client.models.generate_content(
                 model=model_name,
                 contents=prompt,
@@ -121,7 +121,7 @@ Newest message:
             )
 
         try:
-            response = await asyncio.wait_for(asyncio.to_thread(_call_classifier), timeout=10.0)
+            response = await asyncio.wait_for(asyncio.to_thread(_call_classifier), timeout=20.0)
             answer = response.text.strip().lower() if response.text else "no"
             return "yes" in answer
         except Exception:
