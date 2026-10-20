@@ -82,12 +82,14 @@ class MireyAgent:
                 config=types.GenerateContentConfig(
                     system_instruction=system_instruction,
                     temperature=0.7,
+                    # Desactiva búsquedas / llamadas a funciones automáticas que ralentizan
+                    tools=[],
                 ),
             )
 
         try:
             # Aumentado a 60 segundos para evitar falsos timeouts
-            response = await asyncio.wait_for(asyncio.to_thread(_call_gemini), timeout=60.0)
+            response = await asyncio.wait_for(asyncio.to_thread(_call_gemini), timeout=120.0)
             text = response.text.strip() if response.text else ""
             return AgentResponse(text=text)
         except asyncio.TimeoutError:
