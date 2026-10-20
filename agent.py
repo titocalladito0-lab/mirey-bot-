@@ -74,10 +74,11 @@ class MireyAgent:
         if request.repetition_instruction:
             prompt += f"\n\nSystem instruction note: {request.repetition_instruction}"
 
-        # Función interna bloqueante para correr en un hilo separado y no congelar el bot
+        # Función interna bloqueante para correr en un hilo separado
         def _call_gemini():
+            model_name = getattr(self.config, "gemini_model", None) or "gemini-1.5-flash"
             return self.client.models.generate_content(
-                model=self.config.gemini_model,
+                model=model_name,
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     system_instruction=system_instruction,
@@ -86,7 +87,6 @@ class MireyAgent:
             )
 
         try:
-            # Ejecutamos la petición en un hilo secundario con un timeout de 20 segundos
             response = await asyncio.wait_for(asyncio.to_thread(_call_gemini), timeout=20.0)
             text = response.text.strip() if response.text else ""
             return AgentResponse(text=text)
@@ -110,8 +110,9 @@ Newest message:
 {content}"""
 
         def _call_classifier():
+            model_name = getattr(self.config, "gemini_model", None) or "gemini-1.5-flash"
             return self.client.models.generate_content(
-                model=self.config.gemini_model,
+                model=model_name,
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     max_output_tokens=10,
