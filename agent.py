@@ -1,223 +1,238 @@
 from __future__ import annotations
 
 import asyncio
+import io
+import os
 import logging
 import time
-from dataclasses import dataclass, field
-from typing import Any
+from collections import defaultdict
 
-from google import genai
-from google.genai import errors, types
-
-from config import Settings, settings
-from memory import MemoryStore
+from agent import AgentRequest, MireyAgent
+from config import settings
+from memory import MemoryStore, context_key_for_dm, context_key_for_guild
+from metrics import MetricsCollector, MessageSnapshot
+from observability import run_observability_server
 from personas import PeopleStore
 from storage import Database
 
+logging.basicConfig(
+    level=getattr(logging, settings.log_level.upper(), logging.INFO) if hasattr(settings, 'log_level') else logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 log = logging.getLogger("mirey")
+log.setLevel(logging.DEBUG)
 
 
-@dataclass
-class AgentRequest:
-    content: str
-    author_name: str
-    author_id: str
-    context_key: str
-    channel_name: str
-    guild_id: str
-    server_name: str
-    is_dm: bool = False
-    context_snapshot: list[dict[str, Any]] | None = None
-    repetition_instruction: str = ""
+def _import_discord():
+    try:
+        import discord
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("Install runtime dependencies with `pip install -r requirements.txt`.") from exc
+    return discord
 
 
-@dataclass
-class AgentResponse:
-    text: str
+def build_client():
+    discord = _import_discord()
+    intents = discord.Intents.default()
+    intents.guilds = True
+    intents.message_content = True
+    try:
+        intents.members = True
+    except AttributeError:
+        pass
 
+    client = discord.Client(intents=intents)
+    db = Database(settings.db_path)
+    db.init()
+    memory = MemoryStore(db, settings.context_token_budget)
+    people = PeopleStore.load(settings.people_path)
+    mirey = MireyAgent(memory=memory, people=people, db=db, config=settings)
+    metrics = MetricsCollector()
+    server_queues = defaultdict(asyncio.Queue)
+    active_workers: set[str] = set()
+    worker_lock = asyncio.Lock()
 
-class MireyAgent:
-    def __init__(
-        self,
-        memory: MemoryStore,
-        people: PeopleStore,
-        db: Database,
-        config: Settings = settings,
-    ) -> None:
-        self.memory = memory
-        self.people = people
-        self.db = db
-        self.config = config
-        self.client = genai.Client(api_key=config.gemini_api_key)
+    @client.event
+    async def on_ready():
+        guild_names = ", ".join(guild.name for guild in client.guilds)
+        log.info("Connected as %s. Guilds: %s", client.user, guild_names or "none")
+        log.info("Observability dashboard at http://127.0.0.1:8765")
 
-    async def should_respond(
-        self,
-        content: str,
-        context_key: str,
-        bot_was_mentioned: bool,
-        is_dm: bool,
-    ) -> bool:
-        # Solo responde si:
-        # 1. Es un mensaje privado (DM)
-        # 2. Mencionan al bot directamente (@mirey)
-        # 3. Escriben la palabra "mirey" en el texto
-        if is_dm or bot_was_mentioned or "mirey" in content.lower():
-            return True
-            
-        # Si no cumple ninguna de las anteriores, IGNORA el mensaje y no participa
-        return False
+    async def handle_message(message, is_dm: bool) -> None:
+        author_id = str(message.author.id)
 
-    async def generate(self, request: AgentRequest) -> AgentResponse:
-        snapshot = (
-            request.context_snapshot
-            if request.context_snapshot is not None
-            else self.memory.get_snapshot(request.context_key)
+        context_key = (
+            context_key_for_dm(author_id)
+            if is_dm
+            else context_key_for_guild(message.guild.id)
         )
-        
-        system_instruction = self._system_prompt(request)
-        history_text = self._history_text(request.context_key, snapshot=snapshot)
-        
-        prompt = f"{history_text}\n\n[#{request.channel_name}] {request.author_name}: {request.content}"
-        if request.repetition_instruction:
-            prompt += f"\n\nSystem instruction note: {request.repetition_instruction}"
+        channel_name = "dm" if is_dm else message.channel.name
+        guild_id = context_key if is_dm else str(message.guild.id)
+        server_name = "DM" if is_dm else message.guild.name
 
-        def _call_gemini_with_fallback():
-            primary_model = getattr(self.config, "gemini_model", None) or "gemini-3.8-flash"
-            fallback_model = "gemini-1.5-flash"
-            models_to_try = [primary_model, fallback_model]
-            
-            config_params = types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                temperature=0.7,
-                tools=[],
+        memory.append(
+            key=context_key,
+            channel=channel_name,
+            author=message.author.display_name,
+            author_id=author_id,
+            content=message.content,
+        )
+
+        bot_was_mentioned = bool(client.user and client.user in message.mentions)
+
+        if not await mirey.should_respond(
+            content=message.content,
+            context_key=context_key,
+            bot_was_mentioned=bot_was_mentioned,
+            is_dm=is_dm,
+        ):
+            print(f"Decided not to respond to message: {message.content} from {message.author.display_name} in channel {channel_name} (guild: {server_name})")
+            return
+        else:
+            print(f"Responding to message: {message.content} from {message.author.display_name} in channel {channel_name} (guild: {server_name})")
+
+        async with message.channel.typing():
+            snapshot = memory.get_snapshot(context_key)
+            response = await mirey.generate(
+                AgentRequest(
+                    content=message.content,
+                    author_name=message.author.display_name,
+                    author_id=author_id,
+                    context_key=context_key,
+                    channel_name=channel_name,
+                    guild_id=guild_id,
+                    server_name=server_name,
+                    is_dm=is_dm,
+                    context_snapshot=snapshot,
+                )
+            )
+            if mirey.is_repeating_response(context_key, response.text):
+                print(f"Detected repeated response for {context_key}; retrying once with anti-repeat instruction")
+                response = await mirey.generate(
+                    AgentRequest(
+                        content=message.content,
+                        author_name=message.author.display_name,
+                        author_id=author_id,
+                        context_key=context_key,
+                        channel_name=channel_name,
+                        guild_id=guild_id,
+                        server_name=server_name,
+                        is_dm=is_dm,
+                        context_snapshot=snapshot,
+                        repetition_instruction=(
+                            "Your last several responses were identical. "
+                            "Either respond meaningfully to the most recent message or stay silent. "
+                            "Reply with [SKIP] if staying silent is correct."
+                        ),
+                    )
+                )
+            print(f"Generated response: {response.text} to {message.author.display_name} in channel {channel_name} (guild: {server_name})")
+
+        if response.text.strip().lower() == "[skip]":
+            print(f"Skipping response to {message.author.display_name} in channel {channel_name} (guild: {server_name})")
+            return
+
+        if response.text:
+            await message.channel.send(content=response.text)
+            memory.append_assistant(
+                key=context_key,
+                channel=channel_name,
+                content=response.text,
             )
 
-            last_exception = None
+    async def guild_worker(context_key: str) -> None:
+        queue = server_queues[context_key]
+        metrics.set_worker_active(context_key, True)
+        while True:
+            message = await queue.get()
+            try:
+                msg_snapshot = MessageSnapshot(
+                    author=message.author.display_name,
+                    author_id=str(message.author.id),
+                    author_avatar_url=message.author.display_avatar.url if message.author.display_avatar else None,
+                    content=message.content[:100],
+                    channel=message.channel.name,
+                    message_id=str(message.id),
+                    created_at=message.created_at.timestamp(),
+                    enqueued_at=time.time(),
+                )
+                metrics.start_processing(context_key, msg_snapshot)
+                
+                await handle_message(message, is_dm=False)
+                
+                metrics.finish_processing(context_key)
+            except Exception:
+                log.exception("Failed to process queued guild message for context %s", context_key)
+                metrics.finish_processing(context_key)
+            finally:
+                queue.task_done()
+                metrics.update_queue_size(context_key, queue.qsize())
 
-            for model in models_to_try:
-                # Intentamos hasta 2 veces por modelo en caso de saturación temporal (503)
-                for attempt in range(2):
-                    try:
-                        response = self.client.models.generate_content(
-                            model=model,
-                            contents=prompt,
-                            config=config_params,
-                        )
-                        if response and response.text:
-                            return response.text.strip()
-                    except errors.ServerError as e:
-                        last_exception = e
-                        # Si es error 503 (saturación), esperamos 2 segundos y reintentamos en el mismo modelo
-                        if getattr(e, "code", None) == 503 and attempt == 0:
-                            time.sleep(2)
-                            continue
-                        break # Si falla de nuevo, pasamos al modelo de respaldo
-                    except errors.ClientError as e:
-                        last_exception = e
-                        break # Si el modelo da error de cliente (ej. 404), probamos directamente el siguiente modelo
-                    except Exception as e:
-                        last_exception = e
-                        break
-            
-            if last_exception:
-                raise last_exception
-            raise Exception("No se pudo obtener respuesta de ningún modelo.")
+            await asyncio.sleep(0.5)
 
-        try:
-            # Aumentado a 120 segundos para dar margen a reintentos y fallbacks
-            response_text = await asyncio.wait_for(
-                asyncio.to_thread(_call_gemini_with_fallback), timeout=120.0
-            )
-            return AgentResponse(text=response_text)
-        except asyncio.TimeoutError:
-            log.warning("Timeout de Gemini API al generar respuesta.")
-            return AgentResponse(text="¡Espera un momento...! Me tardé en conectar con la nube.")
-        except Exception as exc:
-            log.exception("Error llamando a Gemini API: %s", exc)
-            return AgentResponse(text="(✿◠‿◠) me dio un mareo en la nube, probá de nuevo.")
+            async with worker_lock:
+                if queue.empty():
+                    metrics.set_worker_active(context_key, False)
+                    active_workers.discard(context_key)
+                    return
 
-    async def _classify_relevance(self, context_key: str, content: str) -> bool:
-        history = self._history_text(context_key, limit=6)
+    @client.event
+    async def on_message(message):
+        if message.author.bot:
+            return
+
+        is_dm = isinstance(message.channel, discord.DMChannel)
+        author_id = str(message.author.id)
+
+        if is_dm and int(author_id) != getattr(settings, 'owner_discord_id', 0):
+            if getattr(settings, 'reply_to_rejected_dm', False):
+                await message.channel.send("Not for you.")
+            return
+
+        if is_dm:
+            await handle_message(message, is_dm=True)
+            return
+
+        context_key = context_key_for_guild(message.guild.id)
         
-        prompt = f"""Should I respond to the newest Discord message?
-Answer YES or NO only.
+        msg_snapshot = MessageSnapshot(
+            author=message.author.display_name,
+            author_id=str(message.author.id),
+            author_avatar_url=message.author.display_avatar.url if message.author.display_avatar else None,
+            content=message.content[:100],
+            channel=message.channel.name,
+            message_id=str(message.id),
+            created_at=message.created_at.timestamp(),
+            enqueued_at=time.time(),
+        )
+        metrics.enqueue_message(context_key, msg_snapshot)
+        
+        async with worker_lock:
+            await server_queues[context_key].put(message)
+            metrics.update_queue_size(context_key, server_queues[context_key].qsize())
+            if context_key not in active_workers:
+                active_workers.add(context_key)
+                asyncio.create_task(guild_worker(context_key))
 
-Recent context:
-{history}
+    return client, metrics
 
-Newest message:
-{content}"""
 
-        def _call_classifier():
-            model_name = getattr(self.config, "gemini_model", None) or "gemini-3.8-flash"
-            return self.client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    max_output_tokens=10,
-                    temperature=0.1,
-                ),
-            )
+async def main() -> None:
+    bot_token = (
+        getattr(settings, "discord_bot_token", None) 
+        or getattr(settings, "discord_token", None)
+        or os.environ.get("DISCORD_BOT_TOKEN") 
+        or os.environ.get("DISCORD_TOKEN")
+    )
+    if not bot_token:
+        raise RuntimeError("DISCORD_BOT_TOKEN is required.")
+        
+    client, metrics = build_client()
+    
+    asyncio.create_task(run_observability_server(metrics))
+    
+    await client.start(bot_token)
 
-        try:
-            response = await asyncio.wait_for(asyncio.to_thread(_call_classifier), timeout=20.0)
-            answer = response.text.strip().lower() if response.text else "no"
-            return "yes" in answer
-        except Exception:
-            return True
 
-    def is_repeating_response(self, context_key: str, new_response: str) -> bool:
-        normalized_new = self._normalize_for_repeat_check(new_response)
-        if not normalized_new:
-            return False
-        recent = [
-            self._normalize_for_repeat_check(resp)
-            for resp in self.memory.get_recent_assistant(context_key, 3)
-        ]
-        if len(recent) < 3:
-            return False
-        return all(resp == normalized_new for resp in recent)
-
-    @staticmethod
-    def _normalize_for_repeat_check(text: str) -> str:
-        return "".join(
-            char for char in text.lower().strip() if char.isalnum() or char.isspace()
-        ).strip()
-
-    def _system_prompt(self, request: AgentRequest) -> str:
-        notes = self.people.raw
-        try:
-            with open('system_prompt.txt', encoding='utf-8') as f:
-                base_prompt = f.read()
-        except Exception:
-            base_prompt = "You are mirey, a chat companion on Discord."
-
-        return f"""You are mirey - a personal AI assistant running over Discord.
-
-{base_prompt}
-{request.repetition_instruction}
-
-Personal notes context:
-{notes}
-
-Current server: {request.server_name}
-Current channel: {request.channel_name}
-"""
-
-    def _history_text(
-        self,
-        context_key: str,
-        limit: int = 15,
-        snapshot: list[dict[str, Any]] | None = None,
-    ) -> str:
-        entries = (snapshot if snapshot is not None else self.memory.window(context_key))[-limit:]
-        lines = []
-        for entry in entries:
-            role = entry.get("role")
-            author = entry.get("author", "User")
-            content = entry.get("content", "")
-            if role == "assistant":
-                lines.append(f"mirey: {content}")
-            else:
-                lines.append(f"{author}: {content}")
-        return "\n".join(lines)
+if __name__ == "__main__":
+    asyncio.run(main())

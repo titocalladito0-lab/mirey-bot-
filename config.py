@@ -8,7 +8,7 @@ load_dotenv()
 class Settings:
     discord_bot_token: str = os.getenv("DISCORD_BOT_TOKEN", "")
     gemini_api_key: str = os.getenv("GEMINI_API_KEY", "")
-    gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+    gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
     owner_discord_id: int = int(os.getenv("OWNER_DISCORD_ID", "0"))
     db_path: str = os.getenv("DB_PATH", "db.sqlite")
     people_path: str = os.getenv("PEOPLE_PATH", "personas/people.yaml")
