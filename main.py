@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import os
 import logging
 import time
 from collections import defaultdict
@@ -183,8 +184,8 @@ def build_client():
         is_dm = isinstance(message.channel, discord.DMChannel)
         author_id = str(message.author.id)
 
-        if is_dm and int(author_id) != settings.owner_discord_id:
-            if settings.reply_to_rejected_dm:
+        if is_dm and int(author_id) != getattr(settings, 'owner_discord_id', 0):
+            if getattr(settings, 'reply_to_rejected_dm', False):
                 await message.channel.send("Not for you.")
             return
 
@@ -217,13 +218,20 @@ def build_client():
 
 
 async def main() -> None:
-    if not settings.discord_bot_token:
+    bot_token = (
+        getattr(settings, "discord_bot_token", None) 
+        or getattr(settings, "discord_token", None)
+        or os.environ.get("DISCORD_BOT_TOKEN") 
+        or os.environ.get("DISCORD_TOKEN")
+    )
+    if not bot_token:
         raise RuntimeError("DISCORD_BOT_TOKEN is required.")
+        
     client, metrics = build_client()
     
     asyncio.create_task(run_observability_server(metrics))
     
-    await client.start(settings.discord_bot_token)
+    await client.start(bot_token)
 
 
 if __name__ == "__main__":
